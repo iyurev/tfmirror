@@ -3,8 +3,17 @@ package types
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/iyurev/tfmirror/pkg/tools"
 	"os"
 	"path"
+)
+
+const (
+	OsLinux  = "linux"
+	OsDarwin = "darwin"
+
+	ArchAmd64 = "amd64"
+	ArchArm64 = "arm64"
 )
 
 // GpgPublicKey GPG public key representation
@@ -197,7 +206,7 @@ type ProviderPlatformLocalMeta struct {
 }
 
 func NewArchiveMeta(localArchiveLoc string) (*ProviderPlatformLocalMeta, error) {
-	archHash, err := Hash1(localArchiveLoc)
+	archHash, err := tools.Hash1(localArchiveLoc)
 	if err != nil {
 		return nil, err
 	}

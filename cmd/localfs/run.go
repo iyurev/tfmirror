@@ -15,7 +15,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = client.DownloadMain(conf)
+	err = client.DownloadMain()
 	if err != nil {
 		log.Fatal(err)
 	}

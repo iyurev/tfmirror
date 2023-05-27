@@ -5,7 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"github.com/iyurev/tfmirror/pkg/config"
+	tfmerr "github.com/iyurev/tfmirror/pkg/errors"
+	"github.com/iyurev/tfmirror/pkg/tools"
 	"github.com/iyurev/tfmirror/pkg/types"
+	"github.com/rs/zerolog"
+	zlog "github.com/rs/zerolog/log"
 	progbar "github.com/schollz/progressbar/v3"
 	"io"
 	"log"
@@ -21,16 +25,8 @@ const (
 	ProvidersPath = "v1/providers"
 )
 
-var (
-	ErrForbiden = errors.New("server denied access to this endpoint")
-)
-
-func IsWrongStatusCode(statusCode int) bool {
-	return statusCode >= 300 || statusCode < 200
-}
-
-func StatusCodeErr(response *http.Response) error {
-	return errors.New(fmt.Sprintf("response returned wrong status code: %d, from url path: %s", response.StatusCode, response.Request.URL.Path))
+func init() {
+	zlog.WithLevel(zerolog.InfoLevel)
 }
 
 type Client struct {
@@ -38,6 +34,7 @@ type Client struct {
 	Host         string
 	ProvidersUrl string
 	WorkDir      string
+	Conf         *config.Conf
 }
 
 func NewHttpClient(conf *config.Conf) (*Client, error) {
@@ -59,11 +56,14 @@ func NewHttpClient(conf *config.Conf) (*Client, error) {
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		return nil, err
 	}
+
+	zlog.Info()
 	client := &Client{
 		httpClient:   c,
 		Host:         RegistryHost,
 		ProvidersUrl: fmt.Sprintf("https://%s/%s", RegistryHost, ProvidersPath),
 		WorkDir:      workDir,
+		Conf:         conf,
 	}
 	return client, nil
 }
@@ -91,8 +91,9 @@ func (c *Client) DoRequest(method, url string, requestBody io.Reader) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
-	if IsWrongStatusCode(response.StatusCode) {
-		return nil, StatusCodeErr(response)
+
+	if tfmerr.IsWrongStatusCode(response.StatusCode) {
+		return nil, tfmerr.StatusCodeErr(response)
 	}
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
@@ -159,10 +160,11 @@ func (c *Client) DownloadProvider(provSource, version string, downloadList []*ty
 	var localVerIndexPath = fmt.Sprintf("%s/%s.json", localProviderDirPath, version)
 	var localIndexPath = fmt.Sprintf("%s/index.json", localProviderDirPath)
 	var localIndex = types.NewLocalIndex()
+
 	err := localIndex.Unmarshal(localIndexPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			log.Println("Local meta index file doesn't exists, we create it and go ahead.")
+			log.Println("Local meta index file doesn't exists, we'll create it and go ahead.")
 		} else {
 			return err
 		}
@@ -187,18 +189,24 @@ func (c *Client) DownloadProvider(provSource, version string, downloadList []*ty
 	for _, pkgMeta := range downloadList {
 		wg.Add(1)
 		go func(pkgMeta *types.PackageMetadata) {
-
-			err := c.DownloadPackage(pkgMeta, localProviderDirPath)
+			archPath := c.LocalArchivePath(provSource, pkgMeta.Filename)
+			needToDownload, err := NeedToDownload(archPath, pkgMeta, localVerIndex)
 			if err != nil {
 				log.Fatal(err)
 			}
-			archMeta, err := types.NewArchiveMeta(c.LocalArchivePath(provSource, pkgMeta.Filename))
-			if err != nil {
-				log.Fatal(err)
-			}
-			err = localVerIndex.AddMeta(archMeta, pkgMeta.GetPlatform())
-			if err != nil {
-				log.Fatal(err)
+			if needToDownload {
+				err = c.DownloadPackage(pkgMeta, localProviderDirPath)
+				if err != nil {
+					log.Fatal(err)
+				}
+				archMeta, err := types.NewArchiveMeta(archPath)
+				if err != nil {
+					log.Fatal(err)
+				}
+				err = localVerIndex.AddMeta(archMeta, pkgMeta.GetPlatform())
+				if err != nil {
+					log.Fatal(err)
+				}
 			}
 			wg.Done()
 		}(pkgMeta)
@@ -214,8 +222,8 @@ func (c *Client) DownloadProvider(provSource, version string, downloadList []*ty
 	return nil
 }
 
-func (c *Client) DownloadMain(conf *config.Conf) error {
-	for _, provConf := range conf.Providers {
+func (c *Client) DownloadMain() error {
+	for _, provConf := range c.Conf.Providers {
 		availableVersions, err := c.ListVersions(provConf.Source)
 		if err != nil {
 			return err
@@ -242,4 +250,23 @@ func (c *Client) DownloadMain(conf *config.Conf) error {
 	}
 
 	return nil
+}
+
+func NeedToDownload(filePath string, pkgMeta *types.PackageMetadata, localProvIndex *types.ProviderLocalVersionMetadata) (bool, error) {
+	fileExists, err := tools.IsExists(filePath)
+	if err != nil {
+		return true, err
+	}
+	if fileExists {
+		fileHash, err := tools.Hash1(filePath)
+		if err != nil {
+			return true, err
+		}
+		if hashMatched := localProvIndex.HasHash(pkgMeta.GetPlatform().Name(), fileHash); hashMatched {
+			return false, err
+		}
+		return true, nil
+
+	}
+	return true, nil
 }
