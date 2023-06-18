@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"github.com/iyurev/tfmirror/pkg/config"
 	tfmerr "github.com/iyurev/tfmirror/pkg/errors"
+	zaplog "github.com/iyurev/tfmirror/pkg/log"
 	"github.com/iyurev/tfmirror/pkg/tools"
 	"github.com/iyurev/tfmirror/pkg/types"
-	"github.com/rs/zerolog"
-	zlog "github.com/rs/zerolog/log"
 	progbar "github.com/schollz/progressbar/v3"
+	"go.uber.org/zap"
 	"io"
 	"log"
 	"net/http"
@@ -25,19 +25,20 @@ const (
 	ProvidersPath = "v1/providers"
 )
 
-func init() {
-	zlog.WithLevel(zerolog.InfoLevel)
-}
-
 type Client struct {
 	httpClient   http.Client
 	Host         string
 	ProvidersUrl string
 	WorkDir      string
 	Conf         *config.Conf
+	log          *zap.Logger
 }
 
 func NewHttpClient(conf *config.Conf) (*Client, error) {
+	l, err := zaplog.NewLogger(zaplog.DevLogger, zaplog.LevelFromString(conf.Client.LogLevel))
+	if err != nil {
+		return nil, err
+	}
 	headers := http.Header{}
 	headers.Add("Accept", "application/json")
 	t := &http.Transport{}
@@ -45,31 +46,24 @@ func NewHttpClient(conf *config.Conf) (*Client, error) {
 		Timeout:   time.Second * time.Duration(conf.Client.TimeOut),
 		Transport: t,
 	}
-	cwd, err := os.Getwd()
-	if err != nil {
+	if err := os.MkdirAll(conf.Client.WorkDir, 0755); err != nil {
 		return nil, err
 	}
-	var workDir = fmt.Sprintf("%s/workdir", cwd)
-	if conf.Client.WorkDir != "" {
-		workDir = conf.Client.WorkDir
-	}
-	if err := os.MkdirAll(workDir, 0755); err != nil {
-		return nil, err
-	}
-
-	zlog.Info()
 	client := &Client{
 		httpClient:   c,
 		Host:         RegistryHost,
 		ProvidersUrl: fmt.Sprintf("https://%s/%s", RegistryHost, ProvidersPath),
-		WorkDir:      workDir,
+		WorkDir:      conf.Client.WorkDir,
 		Conf:         conf,
+		log:          l,
 	}
 	return client, nil
 }
 
 func (c *Client) ListVersions(providerSource string) (*types.AvailableVersionsResponse, error) {
 	url := fmt.Sprintf("%s/%s/versions", c.ProvidersUrl, providerSource)
+	l := c.log.With(zaplog.FieldProviderSrc(providerSource))
+	l.Debug("list available provider versions")
 	body, err := c.DoRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -79,6 +73,7 @@ func (c *Client) ListVersions(providerSource string) (*types.AvailableVersionsRe
 	if err != nil {
 		return nil, err
 	}
+	l.Debug(fmt.Sprintf("%d versions available for current provider", len(availableVersions.Versions)))
 	return availableVersions, nil
 }
 
@@ -87,11 +82,11 @@ func (c *Client) DoRequest(method, url string, requestBody io.Reader) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
+	c.log.Debug("do http request", zap.String("url", url), zap.String("http_method", method))
 	response, err := c.httpClient.Do(request)
 	if err != nil {
 		return nil, err
 	}
-
 	if tfmerr.IsWrongStatusCode(response.StatusCode) {
 		return nil, tfmerr.StatusCodeErr(response)
 	}
@@ -109,7 +104,9 @@ func (c *Client) GetPackage(providerSource, version string, platform types.Platf
 	if err != nil {
 		return nil, err
 	}
+	l := c.log.With(zaplog.FieldProviderSrc(providerSource), zaplog.FieldProviderVersion(version))
 	packageMeta := &types.PackageMetadata{}
+	l.Debug("get provider package information")
 	if err := json.Unmarshal(respBody, packageMeta); err != nil {
 		return nil, err
 	}
@@ -155,27 +152,29 @@ func (c *Client) DownloadPackage(pkgMeta *types.PackageMetadata, destDir string)
 	return nil
 }
 
+// DownloadProvider download each packages of provided terraform provider version and source.
 func (c *Client) DownloadProvider(provSource, version string, downloadList []*types.PackageMetadata) error {
 	var localProviderDirPath = fmt.Sprintf("%s/%s", c.WorkDir, provSource)
 	var localVerIndexPath = fmt.Sprintf("%s/%s.json", localProviderDirPath, version)
 	var localIndexPath = fmt.Sprintf("%s/index.json", localProviderDirPath)
 	var localIndex = types.NewLocalIndex()
-
+	l := c.log.With(zap.String("prov_source", provSource), zap.String("prov_version", version))
+	l.Debug("trying to unmarshal local index provider")
 	err := localIndex.Unmarshal(localIndexPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			log.Println("Local meta index file doesn't exists, we'll create it and go ahead.")
+			l.Fatal("Local meta index file doesn't exists, we'll create it and go ahead.")
 		} else {
 			return err
 		}
 	}
 	var localVerIndex = types.NewProviderLocalIndex()
-	log.Printf("Add version %s to index.json", version)
+	l.Debug(fmt.Sprintf("Add version %s to index.json", version))
 	localIndex.AddProviderIndex(version)
 	err = localVerIndex.Unmarshal(localVerIndexPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			log.Println("Local provider meta index file doesn't exists, we create it and go ahead.")
+			l.Info("Local provider meta index file doesn't exists, we create it and go ahead.")
 		} else {
 			return err
 		}
@@ -222,25 +221,34 @@ func (c *Client) DownloadProvider(provSource, version string, downloadList []*ty
 	return nil
 }
 
+// DownloadMain going through the whole configuration and download each provider.
 func (c *Client) DownloadMain() error {
 	for _, provConf := range c.Conf.Providers {
+		l := c.log.Named("DownloadMain").With(zaplog.FieldProviderSrc(provConf.Source))
+		l.Debug("get available provider versions")
 		availableVersions, err := c.ListVersions(provConf.Source)
 		if err != nil {
 			return err
 		}
 		for _, version := range availableVersions.Versions {
+			l := c.log.With(zaplog.FieldProviderVersion(version.Version))
 			if provConf.HasVersion(version.Version) {
 				var toDownloadList = make([]*types.PackageMetadata, 0)
 				for _, platform := range provConf.Platforms {
 					if version.HasPlatform(platform) {
+						l := l.With(zaplog.FieldPlatform(&platform)...)
+						l.Debug("there is such platform in metadata")
 						// Add to download list
+						l.Debug("get provider package metadata")
 						pkgMeta, err := c.GetPackage(provConf.Source, version.Version, platform)
 						if err != nil {
 							return err
 						}
+						l.Debug("add provider package metadata to the download list")
 						toDownloadList = append(toDownloadList, pkgMeta)
 					}
 				}
+				l.Info("download the provider packages")
 				if err := c.DownloadProvider(provConf.Source, version.Version, toDownloadList); err != nil {
 					return err
 				}

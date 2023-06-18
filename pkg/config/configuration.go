@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"github.com/iyurev/tfmirror/pkg/types"
 	"github.com/spf13/viper"
+	"os"
 )
 
 const (
@@ -45,8 +47,26 @@ func (p *ProviderConf) DownloadAllPlatforms() bool {
 }
 
 type ClientConf struct {
-	TimeOut int
-	WorkDir string `mapstructure:"workDir"`
+	TimeOut  int    `mapstructure:"timeOut"`
+	WorkDir  string `mapstructure:"workDir"`
+	LogLevel string `mapstructure:"logLevel"`
+}
+
+func (c *ClientConf) SetDefaults() error {
+	if c.LogLevel == "" {
+		c.LogLevel = "info"
+	}
+	if c.WorkDir == "" {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+		c.WorkDir = fmt.Sprintf("%s/workdir", cwd)
+	}
+	if c.TimeOut == 0 {
+		c.TimeOut = 5
+	}
+	return nil
 }
 
 type Conf struct {
@@ -65,7 +85,9 @@ func NewConfig() (*Conf, error) {
 	if err := viper.Unmarshal(conf); err != nil {
 		return nil, err
 	}
-
+	if err := conf.Client.SetDefaults(); err != nil {
+		return nil, err
+	}
 	for k, _ := range conf.Providers {
 		providerConf := conf.Providers[k]
 		providerConf.SetDefaults()
